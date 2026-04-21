@@ -38,6 +38,8 @@ services:
       - ${CLAUDE_HOME}/.claude/sessions:/home/claude/.claude/sessions
       # Shared user config (credentials, theme, prefs - persists across all projects)
       - claude-user-config:/home/claude/.claude/user-config
+      # Claude Code binary store (persists across containers so `claude update` sticks)
+      - claude-bin:/home/claude/.local/share/claude
       # MCP memory persistence (survives container recreation, per-project)
       - claude-mcp-memory:/home/claude/.claude/mcp-memory
       # NuGet.Config from host (read-only staging, processed by entrypoint)
@@ -64,6 +66,9 @@ volumes:
   claude-user-config:
     external: true
     name: claude-user-config
+  claude-bin:
+    external: true
+    name: claude-bin
   claude-mcp-memory:
     name: claude-mcp-memory-${PROJECT_NAME:-default}
   claude-nuget-cache:

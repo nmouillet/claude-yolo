@@ -44,9 +44,12 @@ if ! docker info > /dev/null 2>&1; then
     exit 1
 fi
 
-# Volume partage (external: true dans docker-compose.yml)
+# Volumes partages (external: true dans docker-compose.yml)
 if ! docker volume inspect claude-user-config > /dev/null 2>&1; then
     docker volume create claude-user-config > /dev/null
+fi
+if ! docker volume inspect claude-bin > /dev/null 2>&1; then
+    docker volume create claude-bin > /dev/null
 fi
 
 # ── OAuth credentials ──────────────────────────────────────
@@ -653,6 +656,9 @@ for d in skills projects hooks plans sessions; do
 done
 BASE_NAME=$(basename "$PROJECT_PATH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
 export PROJECT_NAME="$BASE_NAME"
+
+# Set terminal tab title (OSC 0 — works in Windows Terminal, most xterm-likes)
+printf '\e]0;Claude - %s\a' "$(basename "$PROJECT_PATH")"
 
 cd "$SCRIPT_DIR"
 

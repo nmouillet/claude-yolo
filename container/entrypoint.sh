@@ -13,6 +13,12 @@ if [ "$(id -u)" = "0" ]; then
     if [ "$(stat -c '%U' /home/claude/.claude/mcp-memory 2>/dev/null)" != "claude" ]; then
         chown -R claude:claude /home/claude/.claude/mcp-memory
     fi
+    # Claude Code binary store volume (empty named volume -> seeded from image,
+    # ownership may be root on first mount)
+    if [ -d /home/claude/.local/share/claude ] \
+       && [ "$(stat -c '%U' /home/claude/.local/share/claude 2>/dev/null)" != "claude" ]; then
+        chown -R claude:claude /home/claude/.local/share/claude
+    fi
 
     # Authentication priority: base64 credentials > host file > env var token > persistent volume > manual login
     CRED_FILE="/home/claude/.claude/.credentials.json"
@@ -397,6 +403,18 @@ echo "  [SETUP] onboarding=$_HAS_ONBOARD bypass=$_HAS_BYPASS trust=$_HAS_TRUST"
 # ── Claude Code version check (synchronous update at startup) ──
 # The background auto-updater is lazy; check explicitly so the session starts on the
 # latest version. Set CLAUDE_SKIP_UPDATE=true to bypass (useful offline).
+#
+# The binary store /home/claude/.local/share/claude is a persistent volume; the
+# symlink /home/claude/.local/bin/claude lives in the container layer (image-baked),
+# so re-point it to the newest version found in the volume before reading version.
+_CC_VERSIONS_DIR="/home/claude/.local/share/claude/versions"
+if [ -d "$_CC_VERSIONS_DIR" ]; then
+    _CC_LATEST=$(ls -1 "$_CC_VERSIONS_DIR" 2>/dev/null | sort -V | tail -n 1)
+    if [ -n "$_CC_LATEST" ] && [ -x "$_CC_VERSIONS_DIR/$_CC_LATEST" ]; then
+        ln -sf "$_CC_VERSIONS_DIR/$_CC_LATEST" /home/claude/.local/bin/claude
+    fi
+fi
+
 _CC_CURR=$(claude --version 2>/dev/null | awk '{print $1}')
 # Throttle: only run `claude update` if the last successful check is older than
 # CLAUDE_UPDATE_INTERVAL seconds (default 86400 = 24h). Stamp lives on the shared
@@ -419,19 +437,118 @@ fi
 if $_CC_SKIP; then
     echo "  [OK] Claude Code ${_CC_CURR:-?} ($_CC_REASON)"
 else
-    printf "  \033[90m[..] Claude Code %s - verification des mises a jour (timeout 45s)...\033[0m\r" "${_CC_CURR:-?}"
-    if timeout --kill-after=5 45 claude update > /tmp/.claude-update.log 2>&1; then
+    _CC_TIMEOUT="${CLAUDE_UPDATE_TIMEOUT:-120}"
+    _CC_BAR_WIDTH=30
+    _CC_LOG="/tmp/.claude-update.log"
+    : > "$_CC_LOG"
+
+    # Watch binary store to measure download progress (bytes growth over time).
+    # Target size is approximated from the currently installed binary (new version
+    # is typically within ~20% of the old one).
+    _CC_WATCH_DIR="/home/claude/.local/share/claude"
+    _CC_SIZE_INITIAL=$(du -sb "$_CC_WATCH_DIR" 2>/dev/null | awk '{print $1+0}')
+    [ -z "$_CC_SIZE_INITIAL" ] && _CC_SIZE_INITIAL=0
+    _CC_EXPECTED=0
+    if [ -n "$_CC_CURR" ] && [ -f "$_CC_VERSIONS_DIR/$_CC_CURR" ]; then
+        _CC_EXPECTED=$(stat -c '%s' "$_CC_VERSIONS_DIR/$_CC_CURR" 2>/dev/null || echo 0)
+    fi
+
+    # Run update in background so we can draw a progress bar + latest log line.
+    ( claude update < /dev/null > "$_CC_LOG" 2>&1 ) &
+    _CC_PID=$!
+    _CC_START=$(date +%s)
+    _CC_TIMED_OUT=false
+    # Sliding window anchor for speed calculation (rolls every 5s).
+    _CC_WIN_TIME=$_CC_START
+    _CC_WIN_SIZE=$_CC_SIZE_INITIAL
+
+    while kill -0 "$_CC_PID" 2>/dev/null; do
+        _CC_NOW_T=$(date +%s)
+        _CC_ELAPSED=$(( _CC_NOW_T - _CC_START ))
+        if [ "$_CC_ELAPSED" -ge "$_CC_TIMEOUT" ]; then
+            kill -TERM "$_CC_PID" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$_CC_PID" 2>/dev/null || true
+            _CC_TIMED_OUT=true
+            break
+        fi
+        _CC_FILLED=$(( _CC_ELAPSED * _CC_BAR_WIDTH / _CC_TIMEOUT ))
+        [ "$_CC_FILLED" -gt "$_CC_BAR_WIDTH" ] && _CC_FILLED=$_CC_BAR_WIDTH
+        _CC_BAR=$(printf '%*s' "$_CC_FILLED" '' | tr ' ' '#')
+        _CC_EMPTY=$(printf '%*s' $(( _CC_BAR_WIDTH - _CC_FILLED )) '')
+        # `claude update` prints milestones but stays silent during the download
+        # (~15s of a fresh install). Map known milestones to readable phases and
+        # fall back to "telechargement..." once the last noisy line is behind us.
+        _CC_RAW_STATUS=$(tr -d '\r' < "$_CC_LOG" 2>/dev/null | grep -v '^Warning\|^Fix:\|^$' | tail -n 1)
+        case "$_CC_RAW_STATUS" in
+            "") _CC_STATUS="demarrage..." ;;
+            "Current version:"*|"Checking for updates"*) _CC_STATUS="verification..." ;;
+            "Updating configuration"*|"Installation method"*) _CC_STATUS="telechargement..." ;;
+            "Successfully updated"*|"Claude Code is up to date"*) _CC_STATUS="finalisation..." ;;
+            *) _CC_STATUS=$(echo "$_CC_RAW_STATUS" | cut -c1-30) ;;
+        esac
+
+        # Sample bytes growth since start and over the ~5s sliding window.
+        _CC_NOW_SIZE=$(du -sb "$_CC_WATCH_DIR" 2>/dev/null | awk '{print $1+0}')
+        [ -z "$_CC_NOW_SIZE" ] && _CC_NOW_SIZE=$_CC_SIZE_INITIAL
+        _CC_DOWNLOADED=$(( _CC_NOW_SIZE - _CC_SIZE_INITIAL ))
+        [ "$_CC_DOWNLOADED" -lt 0 ] && _CC_DOWNLOADED=0
+        _CC_WIN_ELAPSED=$(( _CC_NOW_T - _CC_WIN_TIME ))
+        _CC_WIN_GROWTH=$(( _CC_NOW_SIZE - _CC_WIN_SIZE ))
+        [ "$_CC_WIN_GROWTH" -lt 0 ] && _CC_WIN_GROWTH=0
+        _CC_SPEED=0
+        if [ "$_CC_WIN_ELAPSED" -gt 0 ] && [ "$_CC_WIN_GROWTH" -gt 0 ]; then
+            _CC_SPEED=$(( _CC_WIN_GROWTH / _CC_WIN_ELAPSED ))
+        fi
+        if [ "$_CC_WIN_ELAPSED" -ge 5 ]; then
+            _CC_WIN_TIME=$_CC_NOW_T
+            _CC_WIN_SIZE=$_CC_NOW_SIZE
+        fi
+
+        # Build speed + ETA suffix (empty when nothing is downloading yet).
+        _CC_DL_SUFFIX=""
+        if [ "$_CC_SPEED" -gt 0 ]; then
+            if [ "$_CC_SPEED" -ge 1048576 ]; then
+                _CC_SPEED_STR=$(awk -v b="$_CC_SPEED" 'BEGIN{printf "%.1f MB/s", b/1048576}')
+            elif [ "$_CC_SPEED" -ge 1024 ]; then
+                _CC_SPEED_STR=$(awk -v b="$_CC_SPEED" 'BEGIN{printf "%.0f KB/s", b/1024}')
+            else
+                _CC_SPEED_STR="${_CC_SPEED} B/s"
+            fi
+            _CC_DL_SUFFIX="  $_CC_SPEED_STR"
+            if [ "$_CC_EXPECTED" -gt 0 ] && [ "$_CC_DOWNLOADED" -lt "$_CC_EXPECTED" ]; then
+                _CC_ETA_SEC=$(( (_CC_EXPECTED - _CC_DOWNLOADED) / _CC_SPEED ))
+                _CC_DL_SUFFIX="${_CC_DL_SUFFIX} ETA ${_CC_ETA_SEC}s"
+            fi
+        fi
+
+        printf "\r\033[2K  \033[90m[..] Claude %s [%s%s] %02d/%02ds  %s%s\033[0m" \
+            "${_CC_CURR:-?}" "$_CC_BAR" "$_CC_EMPTY" "$_CC_ELAPSED" "$_CC_TIMEOUT" "$_CC_STATUS" "$_CC_DL_SUFFIX"
+        sleep 1
+    done
+    wait "$_CC_PID" 2>/dev/null
+    _CC_RC=$?
+    printf "\r\033[2K"
+
+    if [ "$_CC_TIMED_OUT" = "true" ]; then
+        echo -e "  \033[33m[WARN] Claude Code ${_CC_CURR:-?} - timeout ${_CC_TIMEOUT}s (reseau lent ?) - voir $_CC_LOG\033[0m"
+    elif [ "$_CC_RC" -eq 0 ]; then
+        # Re-point symlink in case update installed a newer version
+        if [ -d "$_CC_VERSIONS_DIR" ]; then
+            _CC_LATEST=$(ls -1 "$_CC_VERSIONS_DIR" 2>/dev/null | sort -V | tail -n 1)
+            if [ -n "$_CC_LATEST" ] && [ -x "$_CC_VERSIONS_DIR/$_CC_LATEST" ]; then
+                ln -sf "$_CC_VERSIONS_DIR/$_CC_LATEST" /home/claude/.local/bin/claude
+            fi
+        fi
         _CC_NEW=$(claude --version 2>/dev/null | awk '{print $1}')
         touch "$_CC_STAMP" 2>/dev/null || true
-        printf "\033[2K\r"
         if [ -n "$_CC_CURR" ] && [ -n "$_CC_NEW" ] && [ "$_CC_CURR" != "$_CC_NEW" ]; then
             echo -e "  \033[32m[OK] Claude Code $_CC_CURR -> $_CC_NEW (mis a jour)\033[0m"
         else
             echo "  [OK] Claude Code ${_CC_NEW:-?} (a jour, prochain check dans ${_CC_INTERVAL}s)"
         fi
     else
-        printf "\033[2K\r"
-        echo -e "  \033[33m[WARN] Claude Code ${_CC_CURR:-?} - update check echoue/timeout (hors ligne ?) - voir /tmp/.claude-update.log\033[0m"
+        echo -e "  \033[33m[WARN] Claude Code ${_CC_CURR:-?} - update echoue (exit $_CC_RC) - voir $_CC_LOG\033[0m"
     fi
 fi
 

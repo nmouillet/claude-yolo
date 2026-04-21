@@ -8,6 +8,7 @@ Environnement Docker (Ubuntu 24.04) pour executer Claude Code CLI en mode YOLO s
 claude-yolo/
 ├── run-claude.sh              # Lanceur principal (Bash/WSL)
 ├── run-claude.ps1             # Wrapper Windows : demarre Docker Desktop puis delegue a WSL
+├── install-context-menu.ps1   # Enregistre/supprime l'entree "Ouvrir dans Claude-Yolo" dans l'Explorateur (HKCU, clic droit sur un dossier)
 ├── config.json                # Config lanceur : sourcesRoot (optionnel, defaut = parent du script)
 ├── Dockerfile                 # Image conteneur (9 sections numerotees)
 ├── docker-compose.yml         # Service claude-worker, volumes, limites ressources
@@ -54,6 +55,12 @@ Un log `[SETUP] onboarding=X bypass=Y trust=Z` est affiche au demarrage pour dia
 
 **credentials** : fichier hote complet (avec refreshToken, monte ro) > env var `CLAUDE_CODE_OAUTH_TOKEN` > volume partage > `claude login`
 
+### Volume partage `claude-bin` (binaires Claude Code)
+
+Le store de binaires `/home/claude/.local/share/claude/versions/` est monte sur le volume Docker partage `claude-bin`. Sans ce volume, chaque nouveau conteneur repartait de la version baked dans l'image (ex: 2.1.114) meme si `claude update` avait deja installe une version plus recente lors d'un run precedent — resultat : tourne sur une vieille version pendant 24h a cause du throttle.
+
+Le symlink `/home/claude/.local/bin/claude` vit dans la couche image (pas dans le volume). L'entrypoint le re-pointe automatiquement vers la derniere version trouvee dans `versions/` au demarrage (avant le `claude --version`) et apres un update reussi.
+
 ### NuGet : feeds prives et cache de packages
 
 | Element | Emplacement | Description |
@@ -78,7 +85,7 @@ CLAUDE_FORCE_RESEED=true ./run-claude.sh
 2. Creation des repertoires `.claude/{skills,projects,sessions,plans,hooks,mcp-memory,user-config}`
 3. Merge settings : prefs persistees < `host-settings.json` < config hooks conteneur (trois niveaux via `jq -s '.[0] * .[1] * .[2]'`)
 4. Build MCP : variable `MCP_SERVERS` (JSON) + ajouts conditionnels (brave-search si `BRAVE_API_KEY`, playwright si chromium, github si `GITHUB_TOKEN`, dbhub si `DATABASE_URL`, docker si socket accessible), puis merge avec prefs persistees et host-claude.json
-5. Version check : `claude update` synchrone avec timeout 20s (affiche l'ancienne et la nouvelle version si maj). Contournable via `CLAUDE_SKIP_UPDATE=true`
+5. Version check : `claude update` synchrone avec barre de progression (timeout 120s par defaut, configurable via `CLAUDE_UPDATE_TIMEOUT`). Throttle 24h via le stamp `.last-update-check` sur `claude-user-config`. Contournable via `CLAUDE_SKIP_UPDATE=true`
 6. Statsig : volume partage > hote > rien
 7. Git safe.directory pour `/project`
 8. Trap SIGTERM pour sauvegarder les prefs avant arret conteneur
@@ -88,7 +95,7 @@ CLAUDE_FORCE_RESEED=true ./run-claude.sh
 
 - **Fusion JSON** : toujours `jq -s '.[0] * .[1]'` (ou `.[0] * .[1] * .[2]` pour trois niveaux) -- le dernier argument ecrase les precedents
 - **MCP conditionnels** : pattern `if [ -n "${VAR:-}" ]; then ... fi` pour les variables d'env, `if [ -S /path ]; then ... fi` pour les sockets, `if command -v X &> /dev/null; then ... fi` pour les binaires
-- **Volumes** : convention stricte ro/rw. Host credentials (via `HOST_CREDENTIALS_PATH`, fichier complet avec refreshToken), settings, statsig, NuGet.Config en ro (seeds). Skills, projects, hooks, plans, sessions en rw (persistent sur l'hote). `claude-user-config` volume Docker partage (prefs utilisateur). `claude-nuget-cache` volume partage (cache packages NuGet). MCP memory sur volume nomme par projet. Socket Docker optionnel (commente par defaut dans docker-compose.yml). Pattern fallback fichier vide pour les mounts conditionnels (`HOST_CREDENTIALS_PATH`, `NUGET_CONFIG_PATH`)
+- **Volumes** : convention stricte ro/rw. Host credentials (via `HOST_CREDENTIALS_PATH`, fichier complet avec refreshToken), settings, statsig, NuGet.Config en ro (seeds). Skills, projects, hooks, plans, sessions en rw (persistent sur l'hote). `claude-user-config` volume Docker partage (prefs utilisateur). `claude-bin` volume partage (binaires Claude Code, pour que `claude update` persiste entre conteneurs). `claude-nuget-cache` volume partage (cache packages NuGet). MCP memory sur volume nomme par projet. Socket Docker optionnel (commente par defaut dans docker-compose.yml). Pattern fallback fichier vide pour les mounts conditionnels (`HOST_CREDENTIALS_PATH`, `NUGET_CONFIG_PATH`)
 - **Nommage conteneurs** : `claude-<nom-projet-normalise>` (lowercase, caracteres non-alphanumeriques remplaces par `-`)
 - **Isolation compose** : chaque projet lance un projet compose distinct (`-p claude-<nom>`) via la fonction `dc()` dans les lanceurs, permettant plusieurs containers en parallele
 - **Hooks** : stdin = JSON avec `tool_name` et `tool_input`, exit code 0 = OK, exit code 2 = blocage. Le hook `protect-config.sh` intercepte Read, Edit, Write, Grep, Glob et Bash. Il bloque aussi les fichiers matches par `.gitignore` du projet (via `git check-ignore`)
@@ -124,6 +131,10 @@ PROJECT_PATH="." CLAUDE_HOME="$HOME" PROJECT_NAME="debug" \
 ./run-claude.sh --remote                      # Mode remote-control (QR code pour smartphone)
 .\run-claude.ps1 -Remote                      # Idem depuis Windows
 
+# Integration Explorateur Windows (clic droit -> "Ouvrir dans Claude-Yolo")
+.\install-context-menu.ps1                    # Installe l'entree dans HKCU (pas d'admin)
+.\install-context-menu.ps1 -Uninstall         # Supprime l'entree
+
 # Installer un SDK .NET a la volee (dans le conteneur)
 sudo install-dotnet-sdk.sh 9.0
 sudo install-dotnet-sdk.sh 10.0
@@ -145,7 +156,7 @@ docker run --rm -v claude-user-config:/data alpine ls -la /data
 - **protect-config.sh est dans l'image** (`container/protect-config.sh` -> `/home/claude/.claude/container-hooks/`, hors du montage `hooks` rw) : toute modification necessite un rebuild
 - **jq est une dependance critique** de `entrypoint.sh` (merge JSON, lecture credentials, build MCP)
 - **Le .dockerignore exclut `*.md`** : les fichiers README.md et CLAUDE.md ne sont pas dans l'image Docker (c'est voulu)
-- **Auto-update** : Claude Code utilise l'installeur natif (`~/.local/bin/claude`). `entrypoint.sh` execute `claude update` synchrone (timeout 45s) au plus une fois toutes les 24h, grace a un marqueur `$CONFIG_DIR/.last-update-check` partage entre containers. Log dans `/tmp/.claude-update.log`. Variables : `CLAUDE_SKIP_UPDATE=true` (bypass total, utile hors ligne), `CLAUDE_UPDATE_INTERVAL=<sec>` (defaut 86400). Pour forcer un check immediat : `docker run --rm -v claude-user-config:/data alpine rm /data/.last-update-check`
+- **Auto-update** : Claude Code utilise l'installeur natif. Les binaires (`~/.local/share/claude/versions/`) sont persistes sur le volume partage `claude-bin` ; le symlink `~/.local/bin/claude` vit dans la couche image et est re-pointe au demarrage vers la version la plus recente du volume (sort -V). `entrypoint.sh` execute `claude update` synchrone avec barre de progression (timeout 120s, configurable via `CLAUDE_UPDATE_TIMEOUT`) au plus une fois toutes les 24h, grace a un marqueur `$CONFIG_DIR/.last-update-check` partage. Log dans `/tmp/.claude-update.log`. Variables : `CLAUDE_SKIP_UPDATE=true` (bypass total, utile hors ligne), `CLAUDE_UPDATE_INTERVAL=<sec>` (defaut 86400), `CLAUDE_UPDATE_TIMEOUT=<sec>` (defaut 120). Pour forcer un check immediat : `docker run --rm -v claude-user-config:/data alpine rm /data/.last-update-check`
 - **SDKs .NET dynamiques** : seul le SDK LTS est dans l'image. Les autres SDKs sont installes au premier demarrage selon les `.csproj` et `global.json` du projet. Sans projet .NET, .NET 10 est installe par defaut. Installation a la volee possible via `sudo install-dotnet-sdk.sh X.0`
 - **Volume `claude-user-config`** : partage entre tous les conteneurs (external: true). Cree automatiquement par `run-claude.sh`. Ne pas lancer deux conteneurs en parallele avec le meme volume (conflit d'ecriture)
 - **NuGet.Config DPAPI** : les credentials chiffrees DPAPI du NuGet.Config Windows ne fonctionnent pas sur Linux. Utiliser `NUGET_PRIVATE_FEED_PAT` pour les feeds prives (prompt interactif au premier lancement si feeds prives detectes)
@@ -164,6 +175,7 @@ docker run --rm -v claude-user-config:/data alpine ls -la /data
 | Changer le theme par defaut | Dans le conteneur : `/config` puis quitter. Les prefs sont sauvegardees automatiquement |
 | Token OAuth expire (401) | Automatique : `run-claude.sh` detecte l'expiration et lance `claude setup-token`. Manuel : `claude setup-token` sur l'hote puis relancer |
 | Acceder depuis smartphone | `./run-claude.sh --remote` → QR code → scanner depuis l'app Claude mobile |
+| Integrer au menu contextuel Windows | `.\install-context-menu.ps1` (HKCU, pas d'admin) — desinstaller : `-Uninstall` |
 | Forcer le type de login | `.env` (`CLAUDE_FORCE_RESEED=true`) puis dans le conteneur : `claude login` |
 | Reinitialiser les preferences | `CLAUDE_FORCE_RESEED=true` dans `.env` ou en variable d'environnement |
 | Configurer un feed NuGet prive | `.env` (`NUGET_PRIVATE_FEED_PAT`), le NuGet.Config hote fournit les URLs |
