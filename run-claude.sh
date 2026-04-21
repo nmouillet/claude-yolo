@@ -251,7 +251,12 @@ fi
 
 # If NuGet.Config found with private feeds, check/prompt for PAT
 if [ -n "${NUGET_CONFIG_PATH:-}" ] && [ -f "$NUGET_CONFIG_PATH" ]; then
-    if grep -q '<packageSourceCredentials>' "$NUGET_CONFIG_PATH" 2>/dev/null; then
+    # Detect private feed: stored credentials (DPAPI) OR any non-nuget.org https source.
+    # The second check covers configs where VS handles auth via a Credential Provider
+    # (MSAL, Azure Artifact Credential Provider) — no <packageSourceCredentials> written.
+    _HAS_STORED_CREDS=$(grep -qE '<packageSourceCredentials>' "$NUGET_CONFIG_PATH" 2>/dev/null && echo yes || echo no)
+    _HAS_PRIVATE_FEED=$(grep -qiP '<add[^>]+value="https?://(?!api\.nuget\.org)' "$NUGET_CONFIG_PATH" 2>/dev/null && echo yes || echo no)
+    if [ "$_HAS_STORED_CREDS" = "yes" ] || [ "$_HAS_PRIVATE_FEED" = "yes" ]; then
         # Load PAT from .env if not already set
         NUGET_PAT="${NUGET_PRIVATE_FEED_PAT:-}"
         if [ -z "$NUGET_PAT" ] && [ -f "$SCRIPT_DIR/.env" ]; then
@@ -259,14 +264,19 @@ if [ -n "${NUGET_CONFIG_PATH:-}" ] && [ -f "$NUGET_CONFIG_PATH" ]; then
         fi
 
         if [ -z "$NUGET_PAT" ]; then
+            # Extract private feed names to show in the prompt (best-effort)
+            _FEED_NAMES=$(grep -iP '<add[^>]+value="https?://(?!api\.nuget\.org)' "$NUGET_CONFIG_PATH" 2>/dev/null \
+                | grep -oP 'key="\K[^"]+' | paste -sd ', ' - | head -c 120)
+
             echo ""
             echo -e "  \033[33mFeeds NuGet prives detectes dans la config hote.\033[0m"
-            echo -e "  \033[90mLes credentials Windows (DPAPI) ne fonctionnent pas dans Docker.\033[0m"
-            echo -e "  \033[90mUn Personal Access Token (PAT) est necessaire pour les feeds prives.\033[0m"
+            [ -n "$_FEED_NAMES" ] && echo -e "  \033[90mFeeds : $_FEED_NAMES\033[0m"
+            echo -e "  \033[90mNi les credentials Windows (DPAPI) ni les Credential Providers VS\033[0m"
+            echo -e "  \033[90mne fonctionnent dans Docker. Un Personal Access Token est necessaire.\033[0m"
             echo ""
             echo -e "  \033[90mComment obtenir un PAT :\033[0m"
-            echo -e "  \033[90m  GitLab : Preferences > Access Tokens > scope 'read_api'\033[0m"
             echo -e "  \033[90m  Azure DevOps : User Settings > PAT > scope 'Packaging (Read)'\033[0m"
+            echo -e "  \033[90m  GitLab : Preferences > Access Tokens > scope 'read_api'\033[0m"
             echo -e "  \033[90m  GitHub : Settings > Developer > PAT > scope 'read:packages'\033[0m"
             echo ""
             read -rp "  PAT NuGet (ou Entree pour ignorer) : " NUGET_PAT

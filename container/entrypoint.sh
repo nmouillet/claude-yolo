@@ -19,6 +19,14 @@ if [ "$(id -u)" = "0" ]; then
        && [ "$(stat -c '%U' /home/claude/.local/share/claude 2>/dev/null)" != "claude" ]; then
         chown -R claude:claude /home/claude/.local/share/claude
     fi
+    # Bind-mounted host dirs: Claude Code rewrites files in-place (projects/*.jsonl
+    # during /compact, sessions, etc). Files left over from older runs with a different
+    # UID (e.g. pre-gosu root runs) break rewrites with EACCES. Scan and fix mismatches.
+    for _d in projects skills plans sessions hooks; do
+        _path="/home/claude/.claude/$_d"
+        [ -d "$_path" ] && find "$_path" \( ! -user claude -o ! -group claude \) \
+            -exec chown claude:claude {} + 2>/dev/null || true
+    done
 
     # Authentication priority: base64 credentials > host file > env var token > persistent volume > manual login
     CRED_FILE="/home/claude/.claude/.credentials.json"
