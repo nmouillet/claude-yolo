@@ -1,0 +1,5 @@
+.env
+run-claude.*
+*.md
+config.json
+.claude/

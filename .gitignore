@@ -1,0 +1,13 @@
+
+.env
+.env.local
+.env.*.local
+
+.claude/settings.local.json
+
+*.credentials.json
+.credentials.json
+*.pem
+*.pfx
+*.p12
+*.key
