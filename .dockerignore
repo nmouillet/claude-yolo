@@ -1,5 +1,5 @@
 .env
-run-claude.*
+tools/
 *.md
 config.json
 .claude/

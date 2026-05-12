@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Ajoute/supprime l'entree "Ouvrir dans Claude-Yolo" dans le menu contextuel Windows.
+    Ajoute/supprime l'entree "Ouvrir avec Claude YOLO" dans le menu contextuel Windows.
 .DESCRIPTION
     Enregistre run-claude.ps1 dans HKCU\Software\Classes\Directory pour qu'il soit
     accessible via clic droit sur un dossier, ou dans l'arriere-plan d'un dossier.
@@ -8,15 +8,15 @@
 
     Sur Windows 11, l'entree apparait sous "Afficher plus d'options" (Shift+F10).
 .EXAMPLE
-    .\install-context-menu.ps1                          # Installe
-    .\install-context-menu.ps1 -Uninstall               # Desinstalle
-    .\install-context-menu.ps1 -Label "Claude YOLO"     # Etiquette personnalisee
+    .\tools\windows_context_menu\install-context-menu.ps1                          # Installe
+    .\tools\windows_context_menu\install-context-menu.ps1 -Uninstall               # Desinstalle
+    .\tools\windows_context_menu\install-context-menu.ps1 -Label "Claude YOLO"     # Etiquette personnalisee
 #>
 
 [CmdletBinding()]
 param(
     [switch]$Uninstall,
-    [string]$Label = "Ouvrir dans Claude-Yolo"
+    [string]$Label = "Ouvrir avec Claude YOLO"
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,9 +41,10 @@ if ($Uninstall) {
     exit 0
 }
 
-# -- Resoudre le chemin du lanceur --
+# -- Resoudre le chemin du lanceur (sous tools/launch_shortcuts/) --
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Launcher = Join-Path $ScriptDir "run-claude.ps1"
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
+$Launcher = Join-Path $RepoRoot "tools\launch_shortcuts\run-claude.ps1"
 
 if (-not (Test-Path $Launcher)) {
     Write-Error "Lanceur introuvable : $Launcher"
@@ -58,13 +59,20 @@ if ($PwshCmd) {
     $PwshExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 }
 
+# -- Icone du menu (fallback sur l'executable PowerShell si absente) --
+$IconPath = Join-Path $ScriptDir "claude-icon.ico"
+if (-not (Test-Path $IconPath)) {
+    Write-Warning "Icone introuvable ($IconPath) - fallback sur l'icone PowerShell"
+    $IconPath = $PwshExe
+}
+
 # %V = chemin du dossier clique (Directory\shell) ou du dossier courant (Background\shell)
 $Command = '"{0}" -ExecutionPolicy Bypass -NoProfile -File "{1}" -ProjectPath "%V"' -f $PwshExe, $Launcher
 
 foreach ($root in $Roots) {
     New-Item -Path $root -Force | Out-Null
     Set-ItemProperty -Path $root -Name "(Default)" -Value $Label
-    Set-ItemProperty -Path $root -Name "Icon" -Value $PwshExe
+    Set-ItemProperty -Path $root -Name "Icon" -Value $IconPath
 
     $cmdKey = Join-Path $root "command"
     New-Item -Path $cmdKey -Force | Out-Null
@@ -77,5 +85,6 @@ Write-Host ""
 Write-Host "Menu contextuel installe." -ForegroundColor Green
 Write-Host "  Lanceur  : $Launcher" -ForegroundColor DarkGray
 Write-Host "  Shell    : $PwshExe" -ForegroundColor DarkGray
+Write-Host "  Icone    : $IconPath" -ForegroundColor DarkGray
 Write-Host "  Clic droit sur un dossier -> `"$Label`"" -ForegroundColor DarkGray
 Write-Host "  (Windows 11 : passer par `"Afficher plus d'options`" ou Shift+F10)" -ForegroundColor DarkGray

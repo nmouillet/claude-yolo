@@ -11,6 +11,8 @@
     .\run-claude.ps1 -Build
     .\run-claude.ps1 -Remote
     .\run-claude.ps1 -Remote -ProjectPath "C:\Sources\mon-projet"
+    .\run-claude.ps1 -Reconfigure              # Relancer le wizard de configuration
+    .\run-claude.ps1 -NoPrompt                 # Skipper le wizard meme au 1er run (utilise les defauts)
 #>
 
 [CmdletBinding()]
@@ -18,7 +20,9 @@ param(
     [string]$ProjectPath,
     [string]$Prompt,
     [switch]$Build,
-    [switch]$Remote
+    [switch]$Remote,
+    [switch]$Reconfigure,
+    [switch]$NoPrompt
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,7 +73,10 @@ function ConvertTo-WslPath {
 }
 
 # -- Convert script dir to WSL path --
+# Script lives under tools/launch_shortcuts/; the repo root (with docker-compose.yml,
+# Dockerfile, config.json, .env) is two levels up.
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
 $WslScriptDir = ConvertTo-WslPath $ScriptDir
 
 # -- Build args for run-claude.sh --
@@ -81,6 +88,14 @@ if ($Build) {
 
 if ($Remote) {
     $shArgs += "--remote"
+}
+
+if ($Reconfigure) {
+    $shArgs += "--reconfigure"
+}
+
+if ($NoPrompt) {
+    $shArgs += "--no-prompt"
 }
 
 if ($Prompt) {
@@ -95,7 +110,7 @@ if ($ProjectPath) {
 }
 
 # -- OAuth: run auth login, then pass credentials to WSL --
-$SourcesRootWin = Split-Path -Parent $ScriptDir
+$SourcesRootWin = Split-Path -Parent $RepoRoot
 $WslSourcesRoot = ConvertTo-WslPath $SourcesRootWin
 $WslUserProfile = ConvertTo-WslPath $env:USERPROFILE
 

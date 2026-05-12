@@ -19,6 +19,11 @@ services:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - CLAUDE_CREDENTIALS_B64=${CLAUDE_CREDENTIALS_B64:-}
       - NUGET_PRIVATE_FEED_PAT=${NUGET_PRIVATE_FEED_PAT:-}
+      - CLAUDE_DISABLE_RTK=${CLAUDE_DISABLE_RTK:-false}
+      - CLAUDE_GIT_CONTEXT_LEVEL=${CLAUDE_GIT_CONTEXT_LEVEL:-default}
+      # Per-project feature wizard
+      - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:-}
+      - CLAUDE_WIZARD_FLAGS=${CLAUDE_WIZARD_FLAGS:-}
     volumes:
       # Project directory - the ONLY writable workspace
       - ${PROJECT_PATH:-.}:/project
@@ -31,21 +36,39 @@ services:
       # Host credentials (read-only, full JSON with refreshToken for auto-refresh)
       - ${HOST_CREDENTIALS_PATH:-/dev/null}:/home/claude/.claude/host-credentials.json:ro
       # Claude user directories (read-write, persist on host)
-      - ${CLAUDE_HOME}/.claude/skills:/home/claude/.claude/skills
+      # Skills: mounted to host-skills/ (overlay source). entrypoint.sh creates a
+      # per-container /home/claude/.claude/skills/ with symlinks, so apply-project-config
+      # can filter skills per-project without modifying the host (which is shared
+      # across all claude-yolo containers).
+      - ${CLAUDE_HOME}/.claude/skills:/home/claude/.claude/host-skills
       - ${CLAUDE_HOME}/.claude/projects:/home/claude/.claude/projects
       - ${CLAUDE_HOME}/.claude/hooks:/home/claude/.claude/hooks
       - ${CLAUDE_HOME}/.claude/plans:/home/claude/.claude/plans
       - ${CLAUDE_HOME}/.claude/sessions:/home/claude/.claude/sessions
+      - ${CLAUDE_HOME}/.claude/commands:/home/claude/.claude/commands
+      - ${CLAUDE_HOME}/.claude/agents:/home/claude/.claude/agents
+      - ${CLAUDE_HOME}/.claude/output-styles:/home/claude/.claude/output-styles
       # Shared user config (credentials, theme, prefs - persists across all projects)
       - claude-user-config:/home/claude/.claude/user-config
+      # Claude YOLO per-project config (read-write, lives in the repo's config/ dir)
+      - ${CLAUDE_YOLO_ROOT:-.}/config:/home/claude/claude-yolo-config:rw
       # Claude Code binary store (persists across containers so `claude update` sticks)
       - claude-bin:/home/claude/.local/share/claude
       # MCP memory persistence (survives container recreation, per-project)
       - claude-mcp-memory:/home/claude/.claude/mcp-memory
+      # Skills overlay (per-project): preserves user-added skills (`/skill add`)
+      # across container recreations. Symlinks are rebuilt from host-skills/ each
+      # session, real dirs are migrated to host-skills at next session start.
+      - claude-skills-overlay:/home/claude/.claude/skills
       # NuGet.Config from host (read-only staging, processed by entrypoint)
       - ${NUGET_CONFIG_PATH:-/dev/null}:/home/claude/.nuget-host/NuGet.Config:ro
       # NuGet package cache (shared Docker volume, avoids cross-platform issues)
       - claude-nuget-cache:/home/claude/.nuget/packages
+      # npm cache (shared, persists across containers — avoids re-downloading
+      # packages when the user runs npm install / npx in /project)
+      - claude-npm-cache:/home/claude/.npm
+      # RTK analytics + config (shared Docker volume, accumulates token savings across projects)
+      - claude-rtk-config:/home/claude/.config/rtk
       # Docker socket (uncomment to enable Docker MCP server)
       # - /var/run/docker.sock:/var/run/docker.sock
     deploy:
@@ -71,5 +94,13 @@ volumes:
     name: claude-bin
   claude-mcp-memory:
     name: claude-mcp-memory-${PROJECT_NAME:-default}
+  claude-skills-overlay:
+    name: claude-skills-overlay-${PROJECT_NAME:-default}
   claude-nuget-cache:
     name: claude-nuget-cache
+  claude-npm-cache:
+    external: true
+    name: claude-npm-cache
+  claude-rtk-config:
+    external: true
+    name: claude-rtk-config

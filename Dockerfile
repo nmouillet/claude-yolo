@@ -67,6 +67,32 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64" \
     && chmod +x /usr/local/bin/yq
 
+# ---------- 1b. RTK (Rust Token Killer) - CLI proxy that compresses Bash tool output ----------
+# Distinct from reachingforthejack/rtk (Rust Type Kit). `rtk gain` is the marker command.
+ARG RTK_VERSION=latest
+RUN set -eux; \
+    if [ "$RTK_VERSION" = "latest" ]; then \
+        RTK_VERSION=$(curl -fsSL https://api.github.com/repos/rtk-ai/rtk/releases/latest | jq -r .tag_name); \
+    fi; \
+    curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz" \
+        -o /tmp/rtk.tar.gz; \
+    tar -xzf /tmp/rtk.tar.gz -C /tmp; \
+    find /tmp -maxdepth 3 -name 'rtk' -type f -executable -exec install -m 0755 {} /usr/local/bin/rtk \; ; \
+    rm -rf /tmp/rtk.tar.gz /tmp/rtk /tmp/rtk-*; \
+    /usr/local/bin/rtk --version; \
+    /usr/local/bin/rtk gain >/dev/null
+
+# ---------- 1c. gum (charmbracelet) - TUI for the per-project feature wizard ----------
+# https://github.com/charmbracelet/gum/releases
+ARG GUM_VERSION=0.16.0
+RUN set -eux; \
+    curl -fsSL "https://github.com/charmbracelet/gum/releases/download/v${GUM_VERSION}/gum_${GUM_VERSION}_Linux_x86_64.tar.gz" \
+        -o /tmp/gum.tar.gz; \
+    tar -xzf /tmp/gum.tar.gz -C /tmp; \
+    find /tmp -maxdepth 3 -name 'gum' -type f -executable -exec install -m 0755 {} /usr/local/bin/gum \; ; \
+    rm -rf /tmp/gum.tar.gz /tmp/gum_*; \
+    /usr/local/bin/gum --version
+
 # ---------- 1a. Chromium for browser automation (optional, skip with --build-arg INSTALL_CHROMIUM=false) ----------
 ARG INSTALL_CHROMIUM=true
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -191,21 +217,42 @@ RUN git config --global user.name "Claude Code" \
     && git config --global init.defaultBranch main
 
 # ---------- 7. Prepare .claude directories ----------
+# skills/ is per-container (overlay); host-skills/ is the bind-mount target shared
+# across containers (read-write so `/skill add` can persist back to host).
 RUN mkdir -p /home/claude/.claude/skills \
+    /home/claude/.claude/host-skills \
     /home/claude/.claude/projects \
     /home/claude/.claude/sessions \
     /home/claude/.claude/plans \
     /home/claude/.claude/hooks \
+    /home/claude/.claude/commands \
+    /home/claude/.claude/agents \
+    /home/claude/.claude/output-styles \
     /home/claude/.claude/container-hooks \
     /home/claude/.claude/mcp-memory
 
 # ---------- 8. Hook: protect sensitive files (stored outside mounted hooks dir) ----------
 COPY --chown=claude:claude container/protect-config.sh /home/claude/.claude/container-hooks/protect-config.sh
-RUN chmod +x /home/claude/.claude/container-hooks/protect-config.sh
+COPY --chown=claude:claude container/git-context.sh /home/claude/.claude/container-hooks/git-context.sh
+# Per-project feature wizard + enumerate + apply (called from claude-session.sh)
+COPY --chown=claude:claude container/enumerate-features.sh /home/claude/.claude/container-hooks/enumerate-features.sh
+COPY --chown=claude:claude container/apply-project-config.sh /home/claude/.claude/container-hooks/apply-project-config.sh
+COPY --chown=claude:claude container/feature-wizard.sh /home/claude/.claude/container-hooks/feature-wizard.sh
+RUN chmod +x /home/claude/.claude/container-hooks/protect-config.sh \
+    /home/claude/.claude/container-hooks/git-context.sh \
+    /home/claude/.claude/container-hooks/enumerate-features.sh \
+    /home/claude/.claude/container-hooks/apply-project-config.sh \
+    /home/claude/.claude/container-hooks/feature-wizard.sh
 
 # ---------- 8a. Statusline script ----------
 COPY --chown=claude:claude container/statusline.sh /home/claude/.claude/statusline.sh
 RUN chmod +x /home/claude/.claude/statusline.sh
+
+# ---------- 8a-bis. Default output styles (seeded into mounted output-styles/ if absent) ----------
+# The output-styles directory is bind-mounted from host (RW), so we can't write
+# directly into it from the image. Stage defaults at /opt/claude-yolo-defaults/
+# and let entrypoint.sh copy them on first run if the user hasn't already.
+COPY --chown=claude:claude container/output-styles/ /opt/claude-yolo-defaults/output-styles/
 
 # ---------- 8b. Claude session wrapper (saves prefs on exit) ----------
 COPY --chown=claude:claude container/claude-session.sh /usr/local/bin/claude-session
@@ -228,6 +275,10 @@ RUN sed -i 's/\r$//' \
     /usr/local/bin/install-dotnet.sh \
     /usr/local/bin/install-dotnet-sdk.sh \
     /home/claude/.claude/container-hooks/protect-config.sh \
+    /home/claude/.claude/container-hooks/git-context.sh \
+    /home/claude/.claude/container-hooks/enumerate-features.sh \
+    /home/claude/.claude/container-hooks/apply-project-config.sh \
+    /home/claude/.claude/container-hooks/feature-wizard.sh \
     /home/claude/.claude/statusline.sh
 
 WORKDIR /project

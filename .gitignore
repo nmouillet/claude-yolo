@@ -11,3 +11,6 @@
 *.pfx
 *.p12
 *.key
+
+# Per-project feature wizard state (user-specific, not versioned)
+config/projects.settings.json

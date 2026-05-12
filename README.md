@@ -30,47 +30,64 @@ cp .env.example .env
 docker compose build
 
 # 4. Launch against a project
-./run-claude.sh                 # Linux / macOS / WSL
-.\run-claude.ps1                # Windows (auto-starts Docker Desktop, delegates to WSL)
+./tools/launch_shortcuts/run-claude.sh                 # Linux / macOS / WSL
+.\tools\launch_shortcuts\run-claude.ps1                # Windows (auto-starts Docker Desktop, delegates to WSL)
 ```
 
-The launcher opens an interactive browser rooted at `sourcesRoot` (from `config.json`, defaults to the parent of the script). Pick a project, and a container named `claude-<project>` is spun up for it.
+The launcher opens an interactive browser rooted at `sourcesRoot` (from `config.json`, defaults to the parent of the repo). Pick a project, and a container named `claude-<project>` is spun up for it.
+
+## First-run wizard (per-project configuration)
+
+The first time you open a project, an interactive wizard (built with [gum](https://github.com/charmbracelet/gum)) lets you pick exactly which plugins, MCP servers, custom skills, hooks (RTK), default model, and effort level should be active **for this project**. Your choices are saved to `config/projects.settings.json` (gitignored).
+
+On subsequent runs the wizard shows a compact summary and starts immediately when you press **Enter** — or `Modify` if you want to change anything.
+
+| Flag | Effect |
+|------|--------|
+| `--reconfigure` / `-Reconfigure` | Re-open the full editor wizard, even if a config already exists |
+| `--no-prompt` / `-NoPrompt` | Skip the wizard entirely (uses existing config or auto-detected preset). Implicitly set when running with `--prompt` |
+
+The wizard auto-detects a sensible **preset** based on the project contents (`.csproj` + `vue` → `dotnet-vue`, `ansible.cfg` → `ansible`, `pyproject.toml` → `python`, etc.) and pre-checks reasonable defaults. You always validate before anything is saved.
+
+Why this matters: enabling 12 plugins for a project that only needs 2 silently injects ~10 KB of skill descriptions into every session prompt. The wizard makes the cost explicit and trims it to what each project really uses.
 
 ## Launchers
 
-### Bash (`run-claude.sh`)
+Both launchers live under `tools/launch_shortcuts/`. They locate the repo root (two levels up) automatically; the underlying `docker compose build` always runs from there.
+
+### Bash (`tools/launch_shortcuts/run-claude.sh`)
 
 ```bash
-./run-claude.sh                       # Interactive project browser
-./run-claude.sh /path/to/project      # Direct path
-./run-claude.sh --build               # Rebuild image first
-./run-claude.sh --prompt "run tests"  # Non-interactive (one-shot prompt)
-./run-claude.sh --remote              # Remote-control mode (QR code for mobile)
-./run-claude.sh --sources-root <dir>  # Override sourcesRoot for this run
+./tools/launch_shortcuts/run-claude.sh                       # Interactive project browser
+./tools/launch_shortcuts/run-claude.sh /path/to/project      # Direct path
+./tools/launch_shortcuts/run-claude.sh --build               # Rebuild image first
+./tools/launch_shortcuts/run-claude.sh --prompt "run tests"  # Non-interactive (one-shot prompt)
+./tools/launch_shortcuts/run-claude.sh --remote              # Remote-control mode (QR code for mobile)
+./tools/launch_shortcuts/run-claude.sh --sources-root <dir>  # Override sourcesRoot for this run
 ```
 
 Browser navigation: type the folder number, `0` to go up, `Enter` to select, `q` to quit.
 
-### PowerShell (`run-claude.ps1`)
+### PowerShell (`tools/launch_shortcuts/run-claude.ps1`)
 
 ```powershell
-.\run-claude.ps1                                   # Interactive
-.\run-claude.ps1 -ProjectPath "C:\Sources\myapp"   # Direct path
-.\run-claude.ps1 -Build                            # Rebuild first
-.\run-claude.ps1 -Prompt "summarize changes"       # Non-interactive
-.\run-claude.ps1 -Remote                           # Mobile remote control
+.\tools\launch_shortcuts\run-claude.ps1                                   # Interactive
+.\tools\launch_shortcuts\run-claude.ps1 -ProjectPath "C:\Sources\myapp"   # Direct path
+.\tools\launch_shortcuts\run-claude.ps1 -Build                            # Rebuild first
+.\tools\launch_shortcuts\run-claude.ps1 -Prompt "summarize changes"       # Non-interactive
+.\tools\launch_shortcuts\run-claude.ps1 -Remote                           # Mobile remote control
 ```
 
 The PowerShell script ensures Docker Desktop is running, then delegates execution to `run-claude.sh` inside WSL.
 
 ### Windows Explorer context menu
 
-Register "Ouvrir dans Claude-Yolo" as a right-click action on any folder (no admin required — entries live in `HKCU`):
+Register "Ouvrir avec Claude YOLO" as a right-click action on any folder (no admin required — entries live in `HKCU`):
 
 ```powershell
-.\install-context-menu.ps1               # Install
-.\install-context-menu.ps1 -Uninstall    # Remove
-.\install-context-menu.ps1 -Label "..."  # Custom label
+.\tools\windows_context_menu\install-context-menu.ps1               # Install
+.\tools\windows_context_menu\install-context-menu.ps1 -Uninstall    # Remove
+.\tools\windows_context_menu\install-context-menu.ps1 -Label "..."  # Custom label
 ```
 
 Two entries are registered: right-click on a folder, and right-click in a folder's empty space. On Windows 11 the entry appears under **Show more options** (or Shift+F10).
@@ -135,17 +152,17 @@ The launchers check token expiry before starting and trigger `claude setup-token
 
 ## MCP servers
 
-Always active:
+The container can boot the following MCP servers; the **per-project wizard** decides which ones are actually exposed to Claude Code for each project.
+
+Built-in (eligible by default):
 
 | Server | Purpose |
 |--------|---------|
-| `filesystem` | Access to `/project` |
-| `memory` | Persistent knowledge graph (per-project volume `claude-mcp-memory-<name>`) |
-| `sequential-thinking` | Structured step-by-step reasoning |
 | `fetch` | Web content retrieval |
 | `context7` | Up-to-date library/framework documentation |
+| `sequential-thinking` | Structured step-by-step reasoning (overlap with extended thinking — opt-in via wizard) |
 
-Conditional (auto-enabled when their prerequisite is present):
+Conditional (auto-detected when their prerequisite is present, then exposed in the wizard):
 
 | Server | Condition |
 |--------|-----------|
@@ -155,7 +172,14 @@ Conditional (auto-enabled when their prerequisite is present):
 | `dbhub` | `DATABASE_URL` set |
 | `docker` | Docker socket mounted (see `docker-compose.yml`) |
 
-MCP configurations from the host `~/.claude.json` are merged at startup — host entries win over container defaults.
+Opt-in via env var (kept disabled by default — covered by native tools or the file-based memory system):
+
+| Server | Env var |
+|--------|---------|
+| `filesystem` | `MCP_ENABLE_FILESYSTEM=true` |
+| `memory` (knowledge graph) | `MCP_ENABLE_MEMORY=true` |
+
+MCP configurations from the host `~/.claude.json` are merged at startup — host entries win over container defaults — then the wizard filters down to your selection.
 
 ## NuGet (.NET)
 
@@ -204,8 +228,8 @@ A `[SETUP]` log line summarizes onboarding flags so you can quickly spot a host 
 | Inspect the shared volume | `docker run --rm -v claude-user-config:/data alpine ls -la /data` |
 | Force an update check | `docker run --rm -v claude-user-config:/data alpine rm /data/.last-update-check` |
 | Clear the NuGet cache | `docker volume rm claude-nuget-cache` |
-| Mobile access | `./run-claude.sh --remote` → scan the QR code with the Claude mobile app |
-| Windows Explorer integration | `.\install-context-menu.ps1` (right-click a folder → "Ouvrir dans Claude-Yolo") |
+| Mobile access | `./tools/launch_shortcuts/run-claude.sh --remote` → scan the QR code with the Claude mobile app |
+| Windows Explorer integration | `.\tools\windows_context_menu\install-context-menu.ps1` (right-click a folder → "Ouvrir avec Claude YOLO") |
 
 ## Troubleshooting
 

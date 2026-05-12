@@ -13,16 +13,32 @@ if [ "$(id -u)" = "0" ]; then
     if [ "$(stat -c '%U' /home/claude/.claude/mcp-memory 2>/dev/null)" != "claude" ]; then
         chown -R claude:claude /home/claude/.claude/mcp-memory
     fi
+    # Skills overlay volume (per-project) may be created as root on first mount
+    if [ -d /home/claude/.claude/skills ] \
+       && [ "$(stat -c '%U' /home/claude/.claude/skills 2>/dev/null)" != "claude" ]; then
+        chown -R claude:claude /home/claude/.claude/skills
+    fi
+    # RTK analytics volume (~/.config/rtk shared across all projects)
+    if [ -d /home/claude/.config/rtk ] \
+       && [ "$(stat -c '%U' /home/claude/.config/rtk 2>/dev/null)" != "claude" ]; then
+        chown -R claude:claude /home/claude/.config/rtk
+    fi
     # Claude Code binary store volume (empty named volume -> seeded from image,
     # ownership may be root on first mount)
     if [ -d /home/claude/.local/share/claude ] \
        && [ "$(stat -c '%U' /home/claude/.local/share/claude 2>/dev/null)" != "claude" ]; then
         chown -R claude:claude /home/claude/.local/share/claude
     fi
+    # npm cache volume (same first-mount ownership issue)
+    if [ -d /home/claude/.npm ] \
+       && [ "$(stat -c '%U' /home/claude/.npm 2>/dev/null)" != "claude" ]; then
+        chown -R claude:claude /home/claude/.npm
+    fi
     # Bind-mounted host dirs: Claude Code rewrites files in-place (projects/*.jsonl
     # during /compact, sessions, etc). Files left over from older runs with a different
     # UID (e.g. pre-gosu root runs) break rewrites with EACCES. Scan and fix mismatches.
-    for _d in projects skills plans sessions hooks; do
+    # Note: skills/ is now per-container (overlay), host-skills/ is the bind mount.
+    for _d in projects host-skills plans sessions hooks; do
         _path="/home/claude/.claude/$_d"
         [ -d "$_path" ] && find "$_path" \( ! -user claude -o ! -group claude \) \
             -exec chown claude:claude {} + 2>/dev/null || true
@@ -150,14 +166,38 @@ fi
 
 # Ensure .claude subdirectories exist
 mkdir -p /home/claude/.claude/skills \
+         /home/claude/.claude/host-skills \
          /home/claude/.claude/projects \
          /home/claude/.claude/sessions \
          /home/claude/.claude/plans \
          /home/claude/.claude/hooks \
+         /home/claude/.claude/commands \
+         /home/claude/.claude/agents \
+         /home/claude/.claude/output-styles \
          /home/claude/.claude/container-hooks \
          /home/claude/.claude/mcp-memory \
          /home/claude/.claude/credentials \
          "$CONFIG_DIR"
+
+# ── Skills overlay : populate per-container skills/ with symlinks to host-skills ──
+# Real directories (added mid-session via /skill add) are preserved; only stale
+# symlinks are pruned. apply-project-config.sh later prunes symlinks NOT in the
+# per-project selection. Default (no project config) keeps all skills enabled.
+SKILLS_DIR="/home/claude/.claude/skills"
+HOST_SKILLS_DIR="/home/claude/.claude/host-skills"
+if [ -d "$HOST_SKILLS_DIR" ]; then
+    # Drop stale symlinks (might point at removed host skills); keep real dirs.
+    find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type l -delete 2>/dev/null || true
+    _n_linked=0
+    for _skill in "$HOST_SKILLS_DIR"/*/; do
+        [ -d "$_skill" ] || continue
+        _name=$(basename "$_skill")
+        # Don't shadow a real dir already in skills/ (user-added skill not yet captured)
+        [ -e "$SKILLS_DIR/$_name" ] && continue
+        ln -s "$_skill" "$SKILLS_DIR/$_name" 2>/dev/null && _n_linked=$((_n_linked + 1))
+    done
+    echo "  [OK] Skills overlay : $_n_linked symlinks vers host-skills"
+fi
 
 # ── Auth diagnostic (visible after docker attach connects) ──
 _AUTH_STATUS=$(cat /tmp/.claude-auth-status 2>/dev/null || echo "unknown")
@@ -190,6 +230,16 @@ CONTAINER_CONFIG='{
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/claude/.claude/container-hooks/git-context.sh"
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
@@ -199,14 +249,31 @@ CONTAINER_CONFIG='{
   "forceLoginMethod": "claudeai"
 }'
 
+# RTK (Rust Token Killer): append a second PreToolUse hook on Bash that rewrites
+# commands to their `rtk <cmd>` equivalent. The hook is `rtk hook claude` (native
+# subcommand of the rtk binary, not a separate script). Order matters: protect-config
+# runs first (can block via exit 2); rtk hook then transforms tool_input if allowed.
+if [ "${CLAUDE_DISABLE_RTK:-false}" != "true" ] && command -v rtk &> /dev/null; then
+    CONTAINER_CONFIG=$(echo "$CONTAINER_CONFIG" | jq '.hooks.PreToolUse += [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": "rtk hook claude"}]
+    }]')
+    echo "  [SETUP] RTK actif (token-killer hook enregistre sur Bash)"
+else
+    echo "  [SETUP] RTK desactive (CLAUDE_DISABLE_RTK=${CLAUDE_DISABLE_RTK:-false})"
+fi
+
 # Build settings.json: defaults < persistent user prefs < host settings < container hooks
 # Container hooks always win (immutable). Defaults fill the gap when neither user prefs nor host set a value.
-DEFAULT_SETTINGS='{
-  "model": "default"
-}'
+# Do NOT default `model` here: the literal string "default" is not a valid model identifier
+# (valid values are aliases like sonnet/opus/haiku or full IDs). Leave it unset so Claude Code
+# uses its built-in default selection.
+DEFAULT_SETTINGS='{}'
 SETTINGS_BASE="$DEFAULT_SETTINGS"
 if [ -f "$CONFIG_DIR/user-settings.json" ] && [ -s "$CONFIG_DIR/user-settings.json" ] && [ "${CLAUDE_FORCE_RESEED:-}" != "true" ]; then
-    SETTINGS_BASE=$(echo "$DEFAULT_SETTINGS" "$(cat "$CONFIG_DIR/user-settings.json")" | jq -s '.[0] * .[1]')
+    # Strip any legacy `model: "default"` written by older entrypoint versions
+    SETTINGS_BASE=$(jq -s '.[0] * (.[1] | if .model == "default" then del(.model) else . end)' \
+        <(echo "$DEFAULT_SETTINGS") "$CONFIG_DIR/user-settings.json")
     echo "  [OK] Preferences settings restaurees depuis le volume"
 fi
 
@@ -244,41 +311,62 @@ else
 fi
 
 # ── MCP Servers : build .claude.json with MCP configurations ──
+# Use direct binaries (installed globally in the image, see Dockerfile section 5d)
+# instead of `npx -y <pkg>`: saves ~1-3s per server at session startup (no registry
+# revalidation, no extra Node spawn).
+#
+# `filesystem` and `memory` MCPs are intentionally NOT registered:
+#  - filesystem: Read/Edit/Write/Grep/Glob native tools cover this scope already
+#  - memory: superseded by the file-based auto-memory system at
+#    /home/claude/.claude/projects/-project/memory/
+# Set MCP_ENABLE_FILESYSTEM=true / MCP_ENABLE_MEMORY=true to re-enable.
 MCP_SERVERS='{
   "mcpServers": {
     "fetch": {
       "command": "uvx",
       "args": ["mcp-server-fetch"]
     },
-    "memory": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory"],
-      "env": {
-        "MEMORY_FILE_PATH": "/home/claude/.claude/mcp-memory/memory.json"
-      }
-    },
     "sequential-thinking": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/project"]
+      "command": "mcp-server-sequential-thinking"
     },
     "context7": {
-      "command": "npx",
-      "args": ["-y", "@upstash/context7-mcp"]
+      "command": "context7-mcp"
     }
   }
 }'
+
+if [ "${MCP_ENABLE_FILESYSTEM:-false}" = "true" ]; then
+    FS_SERVER='{
+      "mcpServers": {
+        "filesystem": {
+          "command": "mcp-server-filesystem",
+          "args": ["/project"]
+        }
+      }
+    }'
+    MCP_SERVERS=$(echo "$MCP_SERVERS" "$FS_SERVER" | jq -s '.[0] * .[1]')
+fi
+
+if [ "${MCP_ENABLE_MEMORY:-false}" = "true" ]; then
+    MEM_SERVER='{
+      "mcpServers": {
+        "memory": {
+          "command": "mcp-server-memory",
+          "env": {
+            "MEMORY_FILE_PATH": "/home/claude/.claude/mcp-memory/memory.json"
+          }
+        }
+      }
+    }'
+    MCP_SERVERS=$(echo "$MCP_SERVERS" "$MEM_SERVER" | jq -s '.[0] * .[1]')
+fi
 
 # Conditionally add Brave Search MCP (only if BRAVE_API_KEY is set)
 if [ -n "${BRAVE_API_KEY:-}" ]; then
     BRAVE_SERVER=$(jq -n --arg key "$BRAVE_API_KEY" '{
       "mcpServers": {
         "brave-search": {
-          "command": "npx",
-          "args": ["-y", "@brave/brave-search-mcp-server"],
+          "command": "brave-search-mcp-server",
           "env": {
             "BRAVE_API_KEY": $key
           }
@@ -293,8 +381,8 @@ if command -v chromium &> /dev/null; then
     PLAYWRIGHT_SERVER='{
       "mcpServers": {
         "playwright": {
-          "command": "npx",
-          "args": ["-y", "@playwright/mcp", "--headless"]
+          "command": "playwright-mcp",
+          "args": ["--headless"]
         }
       }
     }'
@@ -303,7 +391,7 @@ fi
 
 # Conditionally add GitHub MCP (only if GITHUB_TOKEN is set)
 if [ -n "${GITHUB_TOKEN:-}" ]; then
-    # Try Go binary first, fall back to npm package
+    # Try Go binary first, fall back to global npm binary
     if [ -f /usr/local/bin/github-mcp-server ] && [ -x /usr/local/bin/github-mcp-server ]; then
         GITHUB_SERVER=$(jq -n --arg token "$GITHUB_TOKEN" '{
           "mcpServers": {
@@ -319,8 +407,7 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
         GITHUB_SERVER=$(jq -n --arg token "$GITHUB_TOKEN" '{
           "mcpServers": {
             "github": {
-              "command": "npx",
-              "args": ["-y", "@modelcontextprotocol/server-github"],
+              "command": "mcp-server-github",
               "env": {
                 "GITHUB_PERSONAL_ACCESS_TOKEN": $token
               }
@@ -336,8 +423,8 @@ if [ -n "${DATABASE_URL:-}" ]; then
     DBHUB_SERVER=$(jq -n --arg dsn "$DATABASE_URL" '{
       "mcpServers": {
         "dbhub": {
-          "command": "npx",
-          "args": ["-y", "@bytebase/dbhub", "--dsn", $dsn]
+          "command": "dbhub",
+          "args": ["--dsn", $dsn]
         }
       }
     }')
@@ -349,8 +436,7 @@ if [ -S /var/run/docker.sock ]; then
     DOCKER_SERVER='{
       "mcpServers": {
         "docker": {
-          "command": "npx",
-          "args": ["-y", "mcp-server-docker"]
+          "command": "mcp-server-docker"
         }
       }
     }'
@@ -388,10 +474,37 @@ if [ -f "$CONFIG_DIR/user-preferences.json" ] && [ -s "$CONFIG_DIR/user-preferen
 fi
 
 if [ -f /home/claude/.claude/host-claude.json ]; then
+    # Filtrer host-claude.json : drop les caches volumineux et les projets non-/project.
+    # Le fichier hôte fait 37 KB dont 17 KB de cachedGrowthBookFeatures (flags Anthropic
+    # internes, pas utiles dans le conteneur) et 8 KB de projets hors /project (chemins
+    # Windows qui ne fonctionnent pas ici). Garde uniquement les champs réellement
+    # nécessaires à l'identité utilisateur et aux flags d'onboarding.
+    HOST_FILTERED=$(jq '{
+        theme,
+        oauthAccount,
+        userID,
+        firstStartTime,
+        numStartups,
+        tipsHistory,
+        hasCompletedOnboarding,
+        hasAvailableSubscription,
+        bypassPermissionsModeAccepted,
+        hasTrustDialogsShown,
+        installMethod,
+        autoUpdatesChannel,
+        toolUsage,
+        skillUsage,
+        enabledPlugins,
+        seenNotifications,
+        projects: (.projects // {} | with_entries(select(.key == "/project")))
+    } | with_entries(select(.value != null))' /home/claude/.claude/host-claude.json)
+    _BEFORE=$(stat -c '%s' /home/claude/.claude/host-claude.json 2>/dev/null || echo 0)
+    _AFTER=$(echo "$HOST_FILTERED" | wc -c)
+    echo "  [OK] host-claude.json filtre : ${_BEFORE}o -> ${_AFTER}o"
     jq -s '.[0] * .[1] * .[2]' \
         <(echo "$MCP_SERVERS") \
         <(echo "$PREFS_BASE") \
-        /home/claude/.claude/host-claude.json \
+        <(echo "$HOST_FILTERED") \
         > /home/claude/.claude.json
 else
     jq -s '.[0] * .[1]' \
@@ -408,13 +521,17 @@ _HAS_BYPASS=$(jq -r '.bypassPermissionsModeAccepted // false' /home/claude/.clau
 _HAS_TRUST=$(jq -r '.projects["/project"].hasTrustDialogAccepted // false' /home/claude/.claude.json)
 echo "  [SETUP] onboarding=$_HAS_ONBOARD bypass=$_HAS_BYPASS trust=$_HAS_TRUST"
 
-# ── Claude Code version check (synchronous update at startup) ──
-# The background auto-updater is lazy; check explicitly so the session starts on the
-# latest version. Set CLAUDE_SKIP_UPDATE=true to bypass (useful offline).
+# ── Claude Code version check (async background update by default) ──
+# The session starts immediately on the currently-installed version. `claude update`
+# runs in the background and installs newer versions into the binary store volume;
+# the symlink re-pointing at the next container start picks them up. The persistent
+# volume `claude-bin` means downloaded versions survive container recreation.
 #
-# The binary store /home/claude/.local/share/claude is a persistent volume; the
-# symlink /home/claude/.local/bin/claude lives in the container layer (image-baked),
-# so re-point it to the newest version found in the volume before reading version.
+# Variables:
+#   CLAUDE_SKIP_UPDATE=true     bypass entirely (offline)
+#   CLAUDE_UPDATE_SYNC=true     wait for update at startup (legacy progress-bar UX)
+#   CLAUDE_UPDATE_INTERVAL=N    throttle window in seconds (default 86400 = 24h)
+#   CLAUDE_UPDATE_TIMEOUT=N     hard timeout in seconds (default 120, sync mode only)
 _CC_VERSIONS_DIR="/home/claude/.local/share/claude/versions"
 if [ -d "$_CC_VERSIONS_DIR" ]; then
     _CC_LATEST=$(ls -1 "$_CC_VERSIONS_DIR" 2>/dev/null | sort -V | tail -n 1)
@@ -424,35 +541,67 @@ if [ -d "$_CC_VERSIONS_DIR" ]; then
 fi
 
 _CC_CURR=$(claude --version 2>/dev/null | awk '{print $1}')
-# Throttle: only run `claude update` if the last successful check is older than
-# CLAUDE_UPDATE_INTERVAL seconds (default 86400 = 24h). Stamp lives on the shared
-# volume so it's shared across all project containers.
 _CC_STAMP="$CONFIG_DIR/.last-update-check"
+_CC_LOCK="$CONFIG_DIR/.update-in-progress"
+_CC_LOG="/tmp/.claude-update.log"
 _CC_INTERVAL="${CLAUDE_UPDATE_INTERVAL:-86400}"
+
+# Determine if we should run an update now
 _CC_SKIP=false
+_CC_REASON=""
 if [ "${CLAUDE_SKIP_UPDATE:-}" = "true" ]; then
-    _CC_SKIP=true
-    _CC_REASON="CLAUDE_SKIP_UPDATE=true"
+    _CC_SKIP=true; _CC_REASON="CLAUDE_SKIP_UPDATE=true"
+elif [ -f "$_CC_LOCK" ]; then
+    # Another container is currently updating. Skip; we'll pick up the new version
+    # at the next start when the symlink re-pointing scans the versions dir.
+    _CC_AGE=$(( $(date +%s) - $(stat -c '%Y' "$_CC_LOCK" 2>/dev/null || echo 0) ))
+    if [ "$_CC_AGE" -lt 600 ]; then
+        _CC_SKIP=true; _CC_REASON="update en cours dans un autre container (${_CC_AGE}s)"
+    else
+        # Stale lock (>10min): assume previous run crashed, remove and proceed
+        rm -f "$_CC_LOCK"
+    fi
 elif [ -f "$_CC_STAMP" ]; then
     _CC_LAST=$(stat -c '%Y' "$_CC_STAMP" 2>/dev/null || echo 0)
     _CC_AGE=$(( $(date +%s) - _CC_LAST ))
     if [ "$_CC_AGE" -lt "$_CC_INTERVAL" ]; then
-        _CC_SKIP=true
-        _CC_REASON="dernier check il y a $((_CC_AGE / 60)) min (< ${_CC_INTERVAL}s)"
+        _CC_SKIP=true; _CC_REASON="dernier check il y a $((_CC_AGE / 60)) min (< ${_CC_INTERVAL}s)"
     fi
 fi
 
+# Background updater: respects lock, touches stamp on success, re-points symlink
+_cc_run_update_bg() {
+    (
+        : > "$_CC_LOG"
+        touch "$_CC_LOCK"
+        trap 'rm -f "$_CC_LOCK"' EXIT
+        if claude update < /dev/null > "$_CC_LOG" 2>&1; then
+            touch "$_CC_STAMP" 2>/dev/null || true
+            if [ -d "$_CC_VERSIONS_DIR" ]; then
+                _new=$(ls -1 "$_CC_VERSIONS_DIR" 2>/dev/null | sort -V | tail -n 1)
+                if [ -n "$_new" ] && [ -x "$_CC_VERSIONS_DIR/$_new" ]; then
+                    ln -sf "$_CC_VERSIONS_DIR/$_new" /home/claude/.local/bin/claude 2>/dev/null || true
+                fi
+            fi
+        fi
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
 if $_CC_SKIP; then
     echo "  [OK] Claude Code ${_CC_CURR:-?} ($_CC_REASON)"
+elif [ "${CLAUDE_UPDATE_SYNC:-false}" != "true" ]; then
+    # Async mode (default): launch update detached, don't block the session
+    _cc_run_update_bg
+    echo "  [OK] Claude Code ${_CC_CURR:-?} (update en arriere-plan, swap au prochain demarrage)"
 else
+    # Sync mode (legacy): keep the progress bar for users on slow networks
     _CC_TIMEOUT="${CLAUDE_UPDATE_TIMEOUT:-120}"
     _CC_BAR_WIDTH=30
-    _CC_LOG="/tmp/.claude-update.log"
     : > "$_CC_LOG"
+    touch "$_CC_LOCK"
+    trap 'rm -f "$_CC_LOCK"' EXIT
 
-    # Watch binary store to measure download progress (bytes growth over time).
-    # Target size is approximated from the currently installed binary (new version
-    # is typically within ~20% of the old one).
     _CC_WATCH_DIR="/home/claude/.local/share/claude"
     _CC_SIZE_INITIAL=$(du -sb "$_CC_WATCH_DIR" 2>/dev/null | awk '{print $1+0}')
     [ -z "$_CC_SIZE_INITIAL" ] && _CC_SIZE_INITIAL=0
@@ -461,12 +610,10 @@ else
         _CC_EXPECTED=$(stat -c '%s' "$_CC_VERSIONS_DIR/$_CC_CURR" 2>/dev/null || echo 0)
     fi
 
-    # Run update in background so we can draw a progress bar + latest log line.
     ( claude update < /dev/null > "$_CC_LOG" 2>&1 ) &
     _CC_PID=$!
     _CC_START=$(date +%s)
     _CC_TIMED_OUT=false
-    # Sliding window anchor for speed calculation (rolls every 5s).
     _CC_WIN_TIME=$_CC_START
     _CC_WIN_SIZE=$_CC_SIZE_INITIAL
 
@@ -484,9 +631,6 @@ else
         [ "$_CC_FILLED" -gt "$_CC_BAR_WIDTH" ] && _CC_FILLED=$_CC_BAR_WIDTH
         _CC_BAR=$(printf '%*s' "$_CC_FILLED" '' | tr ' ' '#')
         _CC_EMPTY=$(printf '%*s' $(( _CC_BAR_WIDTH - _CC_FILLED )) '')
-        # `claude update` prints milestones but stays silent during the download
-        # (~15s of a fresh install). Map known milestones to readable phases and
-        # fall back to "telechargement..." once the last noisy line is behind us.
         _CC_RAW_STATUS=$(tr -d '\r' < "$_CC_LOG" 2>/dev/null | grep -v '^Warning\|^Fix:\|^$' | tail -n 1)
         case "$_CC_RAW_STATUS" in
             "") _CC_STATUS="demarrage..." ;;
@@ -496,7 +640,6 @@ else
             *) _CC_STATUS=$(echo "$_CC_RAW_STATUS" | cut -c1-30) ;;
         esac
 
-        # Sample bytes growth since start and over the ~5s sliding window.
         _CC_NOW_SIZE=$(du -sb "$_CC_WATCH_DIR" 2>/dev/null | awk '{print $1+0}')
         [ -z "$_CC_NOW_SIZE" ] && _CC_NOW_SIZE=$_CC_SIZE_INITIAL
         _CC_DOWNLOADED=$(( _CC_NOW_SIZE - _CC_SIZE_INITIAL ))
@@ -513,7 +656,6 @@ else
             _CC_WIN_SIZE=$_CC_NOW_SIZE
         fi
 
-        # Build speed + ETA suffix (empty when nothing is downloading yet).
         _CC_DL_SUFFIX=""
         if [ "$_CC_SPEED" -gt 0 ]; then
             if [ "$_CC_SPEED" -ge 1048576 ]; then
@@ -537,11 +679,12 @@ else
     wait "$_CC_PID" 2>/dev/null
     _CC_RC=$?
     printf "\r\033[2K"
+    rm -f "$_CC_LOCK"
+    trap - EXIT
 
     if [ "$_CC_TIMED_OUT" = "true" ]; then
         echo -e "  \033[33m[WARN] Claude Code ${_CC_CURR:-?} - timeout ${_CC_TIMEOUT}s (reseau lent ?) - voir $_CC_LOG\033[0m"
     elif [ "$_CC_RC" -eq 0 ]; then
-        # Re-point symlink in case update installed a newer version
         if [ -d "$_CC_VERSIONS_DIR" ]; then
             _CC_LATEST=$(ls -1 "$_CC_VERSIONS_DIR" 2>/dev/null | sort -V | tail -n 1)
             if [ -n "$_CC_LATEST" ] && [ -x "$_CC_VERSIONS_DIR/$_CC_LATEST" ]; then
@@ -560,6 +703,14 @@ else
     fi
 fi
 
+# ── User-level CLAUDE.md (global instructions, applied to every project) ──
+# Persisted on the shared `claude-user-config` volume. Edited in-container with
+# /memory, or directly on the host volume. Skipped if CLAUDE_FORCE_RESEED=true.
+if [ -f "$CONFIG_DIR/CLAUDE.md" ] && [ -s "$CONFIG_DIR/CLAUDE.md" ] && [ "${CLAUDE_FORCE_RESEED:-}" != "true" ]; then
+    cp "$CONFIG_DIR/CLAUDE.md" /home/claude/.claude/CLAUDE.md
+    echo "  [OK] CLAUDE.md global restaure depuis le volume ($(wc -l < /home/claude/.claude/CLAUDE.md) lignes)"
+fi
+
 # ── Statsig cache : persistent volume > host ──
 if [ -d "$CONFIG_DIR/statsig" ] && [ "$(ls -A "$CONFIG_DIR/statsig" 2>/dev/null)" ] && [ "${CLAUDE_FORCE_RESEED:-}" != "true" ]; then
     mkdir -p /home/claude/.claude/statsig
@@ -572,6 +723,19 @@ elif [ -d /home/claude/.claude/host-statsig ]; then
     echo "  [OK] Cache statsig copie depuis l'hote (+ sauvegarde)"
 fi
 
+# ── Seed default output styles into the mounted output-styles/ dir ──
+# Only seed missing files — never overwrite a user-edited style.
+if [ -d /opt/claude-yolo-defaults/output-styles ]; then
+    for _src in /opt/claude-yolo-defaults/output-styles/*.md; do
+        [ -f "$_src" ] || continue
+        _dst="/home/claude/.claude/output-styles/$(basename "$_src")"
+        if [ ! -f "$_dst" ]; then
+            cp "$_src" "$_dst" 2>/dev/null && \
+                echo "  [OK] Output style seeded: $(basename "$_src")"
+        fi
+    done
+fi
+
 # ── Git safe directory ──
 if [ -d /project/.git ]; then
     git config --global --add safe.directory /project
@@ -581,6 +745,14 @@ echo ""
 
 # Readiness marker: entrypoint reached launch (picked up by docker HEALTHCHECK)
 touch /tmp/.claude-ready
+
+# Wizard flags propagation: les lanceurs passent --reconfigure / --no-prompt via
+# CLAUDE_WIZARD_FLAGS (env var). On les passe au wrapper claude-session via une
+# autre env var, en filtrant CLAUDE_ARGS pour ne pas les transmettre à `claude`
+# lui-même qui ne les connait pas.
+if [ -n "${CLAUDE_WIZARD_FLAGS:-}" ]; then
+    export CLAUDE_SESSION_FLAGS="$CLAUDE_WIZARD_FLAGS"
+fi
 
 # Launch Claude (exec replaces bash so claude becomes PID 1 = direct terminal access)
 if [ -n "$CLAUDE_ARGS" ]; then

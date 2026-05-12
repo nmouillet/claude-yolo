@@ -16,13 +16,18 @@ _on_error() {
 trap '_on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/config.json"
+# Script lives under tools/launch_shortcuts/; the repo root (with docker-compose.yml,
+# Dockerfile, config.json, .env) is two levels up.
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONFIG_FILE="$REPO_ROOT/config.json"
 
 # ── Parse args ───────────────────────────────────────────────
 BUILD=false
 PROJECT_PATH=""
 PROMPT=""
 REMOTE=false
+RECONFIGURE=false
+NO_PROMPT=false
 SOURCES_ROOT_ARG=""
 
 while [[ $# -gt 0 ]]; do
@@ -30,6 +35,8 @@ while [[ $# -gt 0 ]]; do
         --build)        BUILD=true; shift ;;
         --prompt)       PROMPT="$2"; shift 2 ;;
         --remote)       REMOTE=true; shift ;;
+        --reconfigure)  RECONFIGURE=true; shift ;;
+        --no-prompt)    NO_PROMPT=true; shift ;;
         --sources-root) SOURCES_ROOT_ARG="$2"; shift 2 ;;
         -*)             echo "Unknown option: $1"; exit 1 ;;
         *)              PROJECT_PATH="$1"; shift ;;
@@ -50,6 +57,12 @@ if ! docker volume inspect claude-user-config > /dev/null 2>&1; then
 fi
 if ! docker volume inspect claude-bin > /dev/null 2>&1; then
     docker volume create claude-bin > /dev/null
+fi
+if ! docker volume inspect claude-rtk-config > /dev/null 2>&1; then
+    docker volume create claude-rtk-config > /dev/null
+fi
+if ! docker volume inspect claude-npm-cache > /dev/null 2>&1; then
+    docker volume create claude-npm-cache > /dev/null
 fi
 
 # ── OAuth credentials ──────────────────────────────────────
@@ -175,8 +188,8 @@ fi
 
 # 2. Fallback: bare token from env var or .env file
 if [ -z "${CLAUDE_CREDENTIALS_B64:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    if [ -f "$SCRIPT_DIR/.env" ]; then
-        ENV_TOKEN=$(grep -oP '^CLAUDE_CODE_OAUTH_TOKEN=\K.+' "$SCRIPT_DIR/.env" 2>/dev/null || true)
+    if [ -f "$REPO_ROOT/.env" ]; then
+        ENV_TOKEN=$(grep -oP '^CLAUDE_CODE_OAUTH_TOKEN=\K.+' "$REPO_ROOT/.env" 2>/dev/null || true)
         if [ -n "$ENV_TOKEN" ]; then
             export CLAUDE_CODE_OAUTH_TOKEN="$ENV_TOKEN"
             echo -e "  \033[32m[OK] Token OAuth depuis .env\033[0m"
@@ -259,8 +272,8 @@ if [ -n "${NUGET_CONFIG_PATH:-}" ] && [ -f "$NUGET_CONFIG_PATH" ]; then
     if [ "$_HAS_STORED_CREDS" = "yes" ] || [ "$_HAS_PRIVATE_FEED" = "yes" ]; then
         # Load PAT from .env if not already set
         NUGET_PAT="${NUGET_PRIVATE_FEED_PAT:-}"
-        if [ -z "$NUGET_PAT" ] && [ -f "$SCRIPT_DIR/.env" ]; then
-            NUGET_PAT=$(grep -oP '^NUGET_PRIVATE_FEED_PAT=\K.+' "$SCRIPT_DIR/.env" 2>/dev/null || true)
+        if [ -z "$NUGET_PAT" ] && [ -f "$REPO_ROOT/.env" ]; then
+            NUGET_PAT=$(grep -oP '^NUGET_PRIVATE_FEED_PAT=\K.+' "$REPO_ROOT/.env" 2>/dev/null || true)
         fi
 
         if [ -z "$NUGET_PAT" ]; then
@@ -283,14 +296,14 @@ if [ -n "${NUGET_CONFIG_PATH:-}" ] && [ -f "$NUGET_CONFIG_PATH" ]; then
 
             if [ -n "$NUGET_PAT" ]; then
                 # Sauvegarder dans .env (meme pattern que le token OAuth)
-                if [ -f "$SCRIPT_DIR/.env" ]; then
-                    if grep -q '^NUGET_PRIVATE_FEED_PAT=' "$SCRIPT_DIR/.env"; then
-                        sed -i "s|^NUGET_PRIVATE_FEED_PAT=.*|NUGET_PRIVATE_FEED_PAT=$NUGET_PAT|" "$SCRIPT_DIR/.env"
+                if [ -f "$REPO_ROOT/.env" ]; then
+                    if grep -q '^NUGET_PRIVATE_FEED_PAT=' "$REPO_ROOT/.env"; then
+                        sed -i "s|^NUGET_PRIVATE_FEED_PAT=.*|NUGET_PRIVATE_FEED_PAT=$NUGET_PAT|" "$REPO_ROOT/.env"
                     else
-                        echo "NUGET_PRIVATE_FEED_PAT=$NUGET_PAT" >> "$SCRIPT_DIR/.env"
+                        echo "NUGET_PRIVATE_FEED_PAT=$NUGET_PAT" >> "$REPO_ROOT/.env"
                     fi
                 else
-                    echo "NUGET_PRIVATE_FEED_PAT=$NUGET_PAT" >> "$SCRIPT_DIR/.env"
+                    echo "NUGET_PRIVATE_FEED_PAT=$NUGET_PAT" >> "$REPO_ROOT/.env"
                 fi
                 echo -e "  \033[32m[OK] PAT NuGet sauvegarde dans .env\033[0m"
             else
@@ -312,10 +325,10 @@ export NUGET_CONFIG_PATH
 
 # ── Load config ──────────────────────────────────────────────
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: config.json not found in $SCRIPT_DIR" >&2
+    echo "Error: config.json not found in $REPO_ROOT" >&2
     exit 1
 fi
-# Priority: --sources-root (from PS1) > config.json > parent of script dir
+# Priority: --sources-root (from PS1) > config.json > parent of repo root
 if [ -n "$SOURCES_ROOT_ARG" ] && [ -d "$SOURCES_ROOT_ARG" ]; then
     SOURCES_ROOT="$SOURCES_ROOT_ARG"
 else
@@ -324,7 +337,7 @@ else
         _CONVERTED=$(_win_to_wsl_path "$SOURCES_ROOT")
         [ -n "$_CONVERTED" ] && SOURCES_ROOT="$_CONVERTED"
     else
-        SOURCES_ROOT="$(dirname "$SCRIPT_DIR")"
+        SOURCES_ROOT="$(dirname "$REPO_ROOT")"
     fi
 fi
 
@@ -660,8 +673,21 @@ start_existing() {
 export PROJECT_PATH
 export CLAUDE_HOME="${CLAUDE_HOME:-$HOME}"
 
+# Per-project wizard plumbing
+export CLAUDE_YOLO_ROOT="$REPO_ROOT"
+export HOST_PROJECT_PATH="$PROJECT_PATH"   # key used in config/projects.settings.json
+# Ensure the per-project config directory exists (docker mount target)
+mkdir -p "$REPO_ROOT/config"
+
+# Wizard flags passed through to claude-session via entrypoint env var.
+# In --prompt mode, force --no-prompt to keep the one-shot call non-blocking.
+_WIZARD_FLAGS=""
+$RECONFIGURE && _WIZARD_FLAGS="$_WIZARD_FLAGS --reconfigure"
+{ $NO_PROMPT || [ -n "$PROMPT" ]; } && _WIZARD_FLAGS="$_WIZARD_FLAGS --no-prompt"
+export CLAUDE_WIZARD_FLAGS="$(echo "$_WIZARD_FLAGS" | xargs)"
+
 # Ensure host .claude subdirectories exist (avoids Docker creating them as root)
-for d in skills projects hooks plans sessions; do
+for d in skills projects hooks plans sessions commands agents output-styles; do
     mkdir -p "${CLAUDE_HOME}/.claude/$d"
 done
 BASE_NAME=$(basename "$PROJECT_PATH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
@@ -670,7 +696,7 @@ export PROJECT_NAME="$BASE_NAME"
 # Set terminal tab title (OSC 0 — works in Windows Terminal, most xterm-likes)
 printf '\e]0;Claude - %s\a' "$(basename "$PROJECT_PATH")"
 
-cd "$SCRIPT_DIR"
+cd "$REPO_ROOT"
 
 if [ -n "$PROMPT" ]; then
     export CLAUDE_ARGS="--dangerously-skip-permissions -p \"$PROMPT\""
